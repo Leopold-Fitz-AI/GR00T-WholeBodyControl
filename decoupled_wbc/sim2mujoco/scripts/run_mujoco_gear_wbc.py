@@ -52,14 +52,14 @@ class GearWbcController:
         self.keyboard_listener(self.control_dict, self.config)
 
     def keyboard_listener(self, control_dict, config):
-        """Listen to key press events and update cmd and height_cmd"""
+        """Listen to key press events and update cmd and height_cmd.
 
-        def on_press(key):
-            try:
-                k = key.char
-            except AttributeError:
-                return  # Special keys ignored
+        Two channels: pynput global listener (needs macOS Input Monitoring
+        permission) + stdin fallback (works without permissions, terminal
+        must have focus). Both feed the same handler.
+        """
 
+        def handle_char(k):
             with self.cmd_lock:
                 if k == "w":
                     control_dict["loco_cmd"][0] += 0.1
@@ -98,21 +98,56 @@ class GearWbcController:
                     control_dict["freq_cmd"] += 0.1
                 elif k == "n":
                     control_dict["freq_cmd"] -= 0.1
+                else:
+                    return
 
                 print(
                     f"Current Commands: loco_cmd = {control_dict['loco_cmd']}, height_cmd = {control_dict['height_cmd']}, rpy_cmd = {control_dict['rpy_cmd']}, freq_cmd = {control_dict['freq_cmd']}"
                 )
 
-        listener = pkb.Listener(on_press=on_press)
-        listener.daemon = True
-        listener.start()
+        def on_press(key):
+            try:
+                handle_char(key.char)
+            except AttributeError:
+                return  # Special keys ignored
+
+        try:
+            listener = pkb.Listener(on_press=on_press)
+            listener.daemon = True
+            listener.start()
+        except Exception as e:
+            print(f"[keyboard] pynput listener unavailable: {e}; using stdin only")
+
+        def stdin_loop():
+            try:
+                import select
+                import sys
+                import termios
+                import tty
+
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                try:
+                    tty.setcbreak(fd)
+                    while True:
+                        if select.select([sys.stdin], [], [], 0.2)[0]:
+                            ch = sys.stdin.read(1)
+                            if ch:
+                                handle_char(ch)
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except Exception as e:
+                print(f"[keyboard] stdin listener stopped: {e}")
+
+        t = threading.Thread(target=stdin_loop, daemon=True)
+        t.start()
 
     def load_config(self, config_path):
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
 
         for path_key in ["policy_path", "xml_path", "walk_policy_path"]:
-            config[path_key] = os.path.join(CONFIG_PATH, config[path_key])
+            config[path_key] = os.path.join(self.CONFIG_PATH, config[path_key])
 
         array_keys = ["kps", "kds", "default_angles", "cmd_scale", "cmd_init"]
         for key in array_keys:
@@ -245,7 +280,7 @@ class GearWbcController:
         def run_inference(input_tensor):
             ort_inputs = {model.get_inputs()[0].name: input_tensor.cpu().numpy()}
             ort_outs = model.run(None, ort_inputs)
-            return torch.tensor(ort_outs[0], device="cuda:0")
+            return torch.tensor(ort_outs[0], device="cpu")  # patched for macOS (no CUDA)
 
         return run_inference
 
